@@ -15,7 +15,7 @@ from nfl_sims.peter_model import (
 )
 
 VIEWS = ["Rankings", "Weekly forecasts", "Team history", "Backtesting"]
-COLORS = {"positive": "#157f78", "negative": "#c68139"}
+COLORS = {"positive": "#2DD4BF", "negative": "#F0B56B"}
 
 
 @st.cache_data(ttl=3600, max_entries=3, show_spinner=False)
@@ -270,8 +270,8 @@ def main() -> None:
         h1 {letter-spacing: -0.045em;}
         [data-testid="stMetricValue"] {font-variant-numeric: tabular-nums;}
         [data-testid="stMetricValue"] {font-size: clamp(1.3rem, 2.1vw, 2rem);}
-        [data-testid="stSidebar"] {border-right: 1px solid #dbe5e8;}
-        div[data-testid="stMetric"] {background: #edf3f1; padding: 1rem; border-radius: .6rem;}
+        [data-testid="stSidebar"] {border-right: 1px solid color-mix(in srgb, currentColor 12%, transparent);}
+        div[data-testid="stMetric"] {background: color-mix(in srgb, currentColor 5%, transparent); padding: 1rem; border-radius: .6rem;}
     </style>""", unsafe_allow_html=True)
     today = date.today()
     latest = today.year if today.month >= 9 else today.year - 1
