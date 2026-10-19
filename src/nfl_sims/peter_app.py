@@ -16,6 +16,23 @@ from nfl_sims.peter_model import (
 
 VIEWS = ["Rankings", "Weekly forecasts", "Team history", "Backtesting"]
 COLORS = {"positive": "#2DD4BF", "negative": "#F0B56B"}
+COMPONENT_COLORS = {"Rating": "#2DD4BF", "Offense": "#60A5FA", "Defense": "#F0B56B"}
+OFFENSE_HELP = (
+    "Supplementary opponent-adjusted offensive efficiency relative to the league "
+    "baseline. Positive is stronger. Dimensionless; offense + defense equals the "
+    "existing Rating. This component does not change ratings or forecasts."
+)
+DEFENSE_HELP = (
+    "Supplementary opponent-adjusted suppression of opposing efficiency relative "
+    "to the league baseline. Positive is stronger defense. Dimensionless; offense "
+    "+ defense equals the existing Rating. This component does not change ratings or forecasts."
+)
+COMPONENT_METHOD = (
+    "Offense and defense are supplementary derived estimates on the Rating scale, "
+    "not points. Positive means stronger offense or defense; offense + defense "
+    "equals Rating. They use the existing prior strength and the observed league-average "
+    "efficiency through the cutoff as their reference. Ratings and forecasts are unchanged."
+)
 
 
 @st.cache_data(ttl=3600, max_entries=3, show_spinner=False)
@@ -121,22 +138,23 @@ def show_rankings(games, season, weeks, default_week, config) -> None:
         return
     ranked.insert(0, "rank", ranked["rating"].rank(method="min", ascending=False).astype(int))
     ranked["points_vs_average"] = ranked["rating"] * config.points_per_rating
-    table, plot = st.columns([1.15, 1])
-    with table:
-        st.dataframe(ranked[["rank", "team", "rating", "points_vs_average", "games", "performance_std"]],
-                     hide_index=True, use_container_width=True, height=650,
-                     column_config={"rank": "Rank", "team": "Team", "games": "Games",
-                                    "rating": st.column_config.NumberColumn("Rating", format="%.4f"),
-                                    "points_vs_average": st.column_config.NumberColumn("Points vs average", format="%+.1f"),
-                                    "performance_std": st.column_config.NumberColumn("Game variability", format="%.4f")})
-    with plot:
+    st.dataframe(ranked[["rank", "team", "rating", "points_vs_average", "games", "performance_std", "offense", "defense"]],
+                 hide_index=True, use_container_width=True, height=650,
+                 column_config={"rank": "Rank", "team": "Team", "games": "Games",
+                                "rating": st.column_config.NumberColumn("Rating", format="%.4f", help="Existing aggregate opponent-adjusted team strength. This remains the rating used for rankings and forecasts."),
+                                "points_vs_average": st.column_config.NumberColumn("Points vs average", format="%+.1f", help="Rating multiplied by the model's points-per-rating-unit setting."),
+                                "performance_std": st.column_config.NumberColumn("Game variability", format="%.4f", help="Sample standard deviation of opponent-adjusted game performances; bye weeks are omitted."),
+                                "offense": st.column_config.NumberColumn("Offense", format="%+.4f", help=OFFENSE_HELP),
+                                "defense": st.column_config.NumberColumn("Defense", format="%+.4f", help=DEFENSE_HELP)})
+    st.caption("Ratings use completed games through the selected week, including completed games in a partially played week. Game variability is the sample standard deviation of actual opponent-adjusted game performances; bye weeks are omitted.")
+    st.caption(COMPONENT_METHOD)
+    with st.expander("Aggregate ranking chart"):
         st.altair_chart(alt.Chart(ranked).mark_bar(cornerRadiusEnd=3).encode(
             y=alt.Y("team:N", sort=ranked["team"].tolist(), title=None),
             x=alt.X("points_vs_average:Q", title="Points above / below average"),
             color=alt.condition(alt.datum.points_vs_average >= 0, alt.value(COLORS["positive"]), alt.value(COLORS["negative"])),
             tooltip=["team", alt.Tooltip("rating:Q", format=".4f"), "games", alt.Tooltip("points_vs_average:Q", format="+.1f")],
         ).properties(height=600), use_container_width=True)
-    st.caption("Ratings use completed games through the selected week, including completed games in a partially played week. Game variability is the sample standard deviation of actual opponent-adjusted game performances; bye weeks are omitted.")
     unplayed = result.ratings.loc[result.ratings["games"].eq(0), "team"].tolist()
     if unplayed:
         st.caption("No usable games yet: " + ", ".join(unplayed))
@@ -177,6 +195,45 @@ def show_forecasts(games, season, weeks, config) -> None:
     download_results(forecasts, f"forecasts_{season}_week_{week}.csv", config)
 
 
+def rating_history_chart(snapshots: pd.DataFrame) -> alt.Chart:
+    """Keep the aggregate visually primary while showing its derived components."""
+    chart_data = snapshots.melt(
+        id_vars="week", value_vars=["rating", "offense", "defense"],
+        var_name="series", value_name="value",
+    )
+    chart_data["series"] = chart_data["series"].map({"rating": "Rating", "offense": "Offense", "defense": "Defense"})
+    series = list(COMPONENT_COLORS)
+    return alt.Chart(chart_data).mark_line(point=True).encode(
+        x=alt.X("week:O", title="Week"),
+        y=alt.Y("value:Q", title="Rating / component (rating units)", scale=alt.Scale(zero=False)),
+        color=alt.Color("series:N", title=None, scale=alt.Scale(domain=series, range=list(COMPONENT_COLORS.values())), legend=alt.Legend(orient="top")),
+        strokeDash=alt.StrokeDash("series:N", scale=alt.Scale(domain=series, range=[[1, 0], [7, 3], [2, 3]]), legend=None),
+        strokeWidth=alt.StrokeWidth("series:N", scale=alt.Scale(domain=series, range=[4, 2, 2]), legend=None),
+        tooltip=[alt.Tooltip("week:O", title="Week"), alt.Tooltip("series:N", title="Metric"), alt.Tooltip("value:Q", title="Rating units", format="+.4f")],
+    ).properties(height=300)
+
+
+def performance_history_chart(history: pd.DataFrame) -> alt.Chart:
+    """Group offense, aggregate, and defense with aggregate performance centered."""
+    chart_data = history.melt(
+        id_vars=["week", "opponent"],
+        value_vars=["offense_performance", "performance", "defense_performance"],
+        var_name="series", value_name="value",
+    )
+    chart_data["series"] = chart_data["series"].map({
+        "offense_performance": "Offense", "performance": "Aggregate performance", "defense_performance": "Defense",
+    })
+    series = ["Aggregate performance", "Offense", "Defense"]
+    return alt.Chart(chart_data).mark_bar().encode(
+        x=alt.X("week:O", title="Week played"),
+        xOffset=alt.XOffset("series:N", sort=["Offense", "Aggregate performance", "Defense"]),
+        y=alt.Y("value:Q", title="Game performance (rating units)"),
+        color=alt.Color("series:N", title=None, scale=alt.Scale(domain=series, range=list(COMPONENT_COLORS.values())), legend=alt.Legend(orient="top")),
+        opacity=alt.condition(alt.datum.series == "Aggregate performance", alt.value(1.0), alt.value(0.75)),
+        tooltip=[alt.Tooltip("week:O", title="Week"), alt.Tooltip("opponent:N", title="Opponent"), alt.Tooltip("series:N", title="Metric"), alt.Tooltip("value:Q", title="Rating units", format="+.4f")],
+    ).properties(height=300)
+
+
 def show_history(games, season, weeks, default_week, config) -> None:
     controls = st.columns(2)
     teams = sorted(set(games["away_team"]) | set(games["home_team"]))
@@ -194,35 +251,34 @@ def show_history(games, season, weeks, default_week, config) -> None:
         return
     row = result.ratings.set_index("team").loc[team]
     columns = st.columns(3)
-    columns[0].metric("Current rating", formatted(row.rating, 4))
-    columns[1].metric("Games", int(row.games))
-    columns[2].metric("Game variability", formatted(row.performance_std, 4))
+    columns[0].metric("Offense", formatted(row.offense, 4), help=OFFENSE_HELP)
+    columns[1].metric("Current rating", formatted(row.rating, 4), help="Existing aggregate rating at the selected cutoff. This remains the rating used for rankings and forecasts; offense + defense equals Rating.")
+    columns[2].metric("Defense", formatted(row.defense, 4), help=DEFENSE_HELP)
+    st.caption(f"{int(row.games)} usable games · Game variability: {formatted(row.performance_std, 4)} rating units (sample standard deviation of adjusted game performances).")
+    st.caption(COMPONENT_METHOD)
     snapshots = []
     for week in weeks:
         if week > cutoff:
             break
         ratings = fit_ratings(games, season, week, config).ratings.set_index("team")
-        snapshots.append({"week": week, "rating": ratings.loc[team, "rating"]})
-    chart_left, chart_right = st.columns(2)
+        snapshots.append({"week": week, **ratings.loc[team, ["rating", "offense", "defense"]].to_dict()})
+    with st.container(key="team_history_charts"):
+        chart_left, chart_right = st.columns(2)
     with chart_left:
-        st.markdown("**Rating after each week**")
-        st.altair_chart(alt.Chart(pd.DataFrame(snapshots)).mark_line(point=True, color=COLORS["positive"]).encode(
-            x=alt.X("week:O", title="Week"), y=alt.Y("rating:Q", title="Rating", scale=alt.Scale(zero=False)),
-            tooltip=["week", alt.Tooltip("rating:Q", format=".4f")],
-        ).properties(height=300), use_container_width=True)
-        st.caption("Each point uses games through that week. Ratings can change during a bye as opponents play.")
+        st.markdown("**Rating and components after each week**")
+        st.altair_chart(rating_history_chart(pd.DataFrame(snapshots)), use_container_width=True)
+        st.caption("The thick solid teal line is the existing Rating. Dashed blue and dotted orange lines show offense and defense. Each point uses only games through that week, with the league baseline and components recalculated at that week's cutoff. Ratings can change during a bye as opponents play.")
     with chart_right:
         st.markdown("**Opponent-adjusted game performances**")
-        st.altair_chart(alt.Chart(history).mark_bar(color=COLORS["positive"]).encode(
-            x=alt.X("week:O", title="Week played"), y=alt.Y("performance:Q", title="Game performance"),
-            tooltip=["week", "opponent", alt.Tooltip("performance:Q", format=".4f")],
-        ).properties(height=300), use_container_width=True)
-        st.caption("Opponents are rated at the selected cutoff. These retrospective game performances are distinct from the week-by-week ratings.")
-    st.dataframe(history[["week", "opponent", "venue", "ps", "ps_diff", "opponent_rating", "performance"]],
+        st.altair_chart(performance_history_chart(history), use_container_width=True)
+        st.caption("Each group shows offense, the existing aggregate game performance (center, teal), then defense. The two components sum to that game's aggregate performance. Opponents and the league baseline are evaluated at the selected cutoff, so these retrospective performances differ from the week-by-week ratings.")
+    st.dataframe(history[["week", "opponent", "venue", "ps", "ps_diff", "opponent_rating", "performance", "offense_performance", "defense_performance"]],
                  hide_index=True, use_container_width=True,
                  column_config={"week": "Week", "opponent": "Opponent", "venue": "Venue",
                                 **{name: st.column_config.NumberColumn(label, format="%.4f") for name, label in
-                                   [("ps", "Game Peter Score"), ("ps_diff", "Peter Score differential"), ("opponent_rating", "Opponent rating"), ("performance", "Adjusted performance")]}})
+                                   [("ps", "Game Peter Score"), ("ps_diff", "Peter Score differential"), ("opponent_rating", "Opponent rating"), ("performance", "Adjusted performance")]},
+                                "offense_performance": st.column_config.NumberColumn("Offense performance", format="%+.4f", help="This game's offensive efficiency relative to the league baseline, adjusted for the opponent's defense at the selected cutoff. Supplementary; positive is stronger."),
+                                "defense_performance": st.column_config.NumberColumn("Defense performance", format="%+.4f", help="This game's suppression of opposing efficiency relative to the league baseline, adjusted for the opponent's offense at the selected cutoff. Supplementary; positive is stronger.")})
     download_results(history, f"history_{season}_{team}_week_{cutoff}.csv", config)
 
 
@@ -272,6 +328,10 @@ def main() -> None:
         [data-testid="stMetricValue"] {font-size: clamp(1.3rem, 2.1vw, 2rem);}
         [data-testid="stSidebar"] {border-right: 1px solid color-mix(in srgb, currentColor 12%, transparent);}
         div[data-testid="stMetric"] {background: color-mix(in srgb, currentColor 5%, transparent); padding: 1rem; border-radius: .6rem;}
+        @media (max-width: 1150px) {
+            .st-key-team_history_charts [data-testid="stHorizontalBlock"] {flex-direction: column;}
+            .st-key-team_history_charts [data-testid="stColumn"] {width: 100%; flex: 1 1 100%;}
+        }
     </style>""", unsafe_allow_html=True)
     today = date.today()
     latest = today.year if today.month >= 9 else today.year - 1
@@ -314,6 +374,8 @@ def main() -> None:
         for note in loaded.notes:
             st.write(note)
         st.write("Peter Score combines normalized yards per play, first downs per play, and third-down conversion. Ratings solve the opponent-adjusted averaging equations directly, with an optional average-team prior. This avoids the old oscillation and iteration limit.")
+        st.write(COMPONENT_METHOD)
+        st.caption("The split assumes offensive efficiency equals the league reference plus offense minus the opponent's defense. Components are provisional with sparse schedules. With zero prior, unidentified splits use a minimum-norm convention; separate component averages need not be zero.")
         st.write(f"Forecast away margin = {config.points_per_rating:g} × (away rating − home rating) − {config.home_advantage:g} at a home venue. Neutral games have no home advantage. Forecasts are point margins; no total or individual final scores are estimated.")
         st.caption("Offensive plays include sacks, kneels, and spikes; tries and nullified plays are excluded. First downs include penalty awards. Third-down rates use recorded conversions and failures. Historical data can receive later official corrections; these are chronological reconstructions from the currently available data.")
         quality = games.loc[completed & ~usable]

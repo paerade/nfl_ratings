@@ -20,10 +20,10 @@ _METRICS = ("ypp", "fpp", "tdc")
 _SCORE_COLUMNS = ("away_score", "home_score")
 _RATE_COLUMNS = tuple(f"{side}_{metric}" for side in ("away", "home") for metric in _METRICS)
 _SCHEDULE_COLUMNS = ("game_id", "season", "week", "away_team", "home_team", "neutral")
-_RATING_COLUMNS = ("team", "rating", "games", "performance_std", "component")
+_RATING_COLUMNS = ("team", "rating", "games", "performance_std", "component", "offense", "defense")
 _PERFORMANCE_COLUMNS = (
     "game_id", "season", "week", "gameday", "team", "opponent", "venue",
-    "ps", "ps_diff", "opponent_rating", "performance",
+    "ps", "ps_diff", "opponent_rating", "performance", "offense_performance", "defense_performance",
 )
 _FORECAST_COLUMNS = (
     "game_id", "season", "week", "gameday", "away_team", "home_team", "neutral",
@@ -182,18 +182,48 @@ def _peter_scores(games: pd.DataFrame, config: ModelConfig) -> tuple[np.ndarray,
     return ((away - low) / span) @ weights, ((home - low) / span) @ weights
 
 
+def _strength_components(
+    design: np.ndarray, away_ps: np.ndarray, home_ps: np.ndarray,
+    ratings: np.ndarray, prior_games: float,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    """Supplement the fixed aggregate with a paired-efficiency decomposition.
+
+    Assume PS_i - mu = O_i - D_j, with the existing ridge strength on both
+    components. In coordinates r=O+D, q=O-D, this separates into the original
+    differential fit for r and a score-sum fit for q. Only q is fitted here;
+    the supplied aggregate is never changed. Zero prior uses minimum norm,
+    including the unidentified direction of a bipartite schedule component.
+    """
+    baseline = float(away_ps.mean() / 2 + home_ps.mean() / 2)
+    sum_design = np.abs(design)
+    target = (away_ps - baseline) + (home_ps - baseline)
+    if prior_games > 0:
+        sum_design = np.vstack([sum_design, np.sqrt(prior_games) * np.eye(design.shape[1])])
+        target = np.concatenate([target, np.zeros(design.shape[1])])
+    balance = np.linalg.lstsq(sum_design, target, rcond=None)[0]
+    offense = (ratings + balance) / 2
+    defense = ratings - offense
+    if not np.isfinite(offense).all() or not np.isfinite(defense).all():
+        raise ValueError("The component solve did not produce finite strengths.")
+    return offense, defense, baseline
+
+
 def fit_ratings(
     games: pd.DataFrame,
     season: int,
     through_week: int,
     config: ModelConfig = ModelConfig(),
+    *,
+    include_components: bool = True,
 ) -> RatingResult:
     """Fit one season through an inclusive week, from completed valid games.
 
     Teams with no valid games retain a missing rating. With a zero prior each
     connected schedule component is centered separately, because their relative
     strength cannot be identified from results. ``residual`` is the maximum
-    absolute residual of the solved normal equations.
+    absolute residual of the solved normal equations. Supplementary offense and
+    defense use the same valid games and prior, and sum to the unchanged rating.
+    Forecasts skip this supplementary calculation entirely.
     """
     _validate_week(through_week, allow_zero=True)
     frame, duplicates_removed = _prepare_games(games)
@@ -229,6 +259,8 @@ def fit_ratings(
         "warnings": warnings,
     }
     rating_values: dict[str, float] = {}
+    offense_values: dict[str, float] = {}
+    defense_values: dict[str, float] = {}
     counts: dict[str, int] = {}
     performance_rows: list[dict[str, Any]] = []
     if len(valid):
@@ -260,6 +292,13 @@ def fit_ratings(
         diagnostics["residual"] = residual
         diagnostics["converged"] = residual <= 1e-8 * max(1.0, float(np.max(np.abs(rhs))))
         rating_values = dict(zip(active, values, strict=True))
+        if include_components:
+            offense, defense, baseline = _strength_components(
+                design, away_ps, home_ps, values, config.prior_games,
+            )
+            offense_values = dict(zip(active, offense, strict=True))
+            defense_values = dict(zip(active, defense, strict=True))
+            diagnostics["efficiency_baseline"] = baseline
         counts = pd.concat([valid["away_team"], valid["home_team"]]).value_counts().to_dict()
         for index, row in enumerate(valid.itertuples()):
             for side, opponent, score, difference in (
@@ -268,19 +307,25 @@ def fit_ratings(
             ):
                 team = getattr(row, f"{side}_team")
                 opponent_rating = rating_values[opponent]
-                performance_rows.append({
+                performance = {
                     "game_id": row.game_id, "season": row.season, "week": row.week,
                     "gameday": row.gameday, "team": team, "opponent": opponent,
                     "venue": "neutral" if row.neutral else side,
                     "ps": float(score), "ps_diff": float(difference),
                     "opponent_rating": opponent_rating,
                     "performance": opponent_rating + float(difference),
-                })
+                }
+                if include_components:
+                    offense_performance = float(score) - baseline + defense_values[opponent]
+                    performance["offense_performance"] = offense_performance
+                    performance["defense_performance"] = performance["performance"] - offense_performance
+                performance_rows.append(performance)
     performances = pd.DataFrame(performance_rows, columns=_PERFORMANCE_COLUMNS)
     deviations = performances.groupby("team")["performance"].std().to_dict() if len(performances) else {}
     ratings = pd.DataFrame([
         {"team": team, "rating": rating_values.get(team, np.nan), "games": counts.get(team, 0),
-         "performance_std": deviations.get(team, np.nan), "component": component_by_team.get(team, pd.NA)}
+         "performance_std": deviations.get(team, np.nan), "component": component_by_team.get(team, pd.NA),
+         "offense": offense_values.get(team, np.nan), "defense": defense_values.get(team, np.nan)}
         for team in teams
     ], columns=_RATING_COLUMNS)
     ratings["component"] = ratings["component"].astype("Int64")
@@ -314,7 +359,7 @@ def forecast_week(
         # the first date of the forecast week. Same-week scores are never used.
         after_cutoff = training["gameday"].ge(earliest_game) | training["gameday"].isna()
         training.loc[after_cutoff, "completed"] = False
-    result = fit_ratings(training, season, week - 1, config)
+    result = fit_ratings(training, season, week - 1, config, include_components=False)
     lookup = result.ratings.set_index("team").to_dict(orient="index")
     output: list[dict[str, Any]] = []
     for game in fixtures.itertuples():
